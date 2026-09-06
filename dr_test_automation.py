@@ -176,8 +176,8 @@ def main():
                 log(f"Wysuwam brakujaca plyte ISO z napedu: {drive}")
                 run_cmd(f"qm set {TEST_VM_ID} --{drive} none")
 
-            log(f"Przepinanie wirtualnej karty do mostka {BRIDGE} (firewall=0) oraz aktywacja VGA std...")
-            run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE},firewall=0 --vga std")
+            log(f"Przepinanie wirtualnej karty do mostka {BRIDGE} (firewall=0) oraz aktywacja VGA std i CPU kvm64...")
+            run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE},firewall=0 --vga std --cpu kvm64")
         else:
             log(f"Czyszczenie potencjalnych pozostalosci po interfejsach veth{TEST_VM_ID}i0...")
             run_cmd(f"ip link delete veth{TEST_VM_ID}i0 2>/dev/null")
