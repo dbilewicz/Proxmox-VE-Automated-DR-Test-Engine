@@ -55,7 +55,7 @@ def log(msg):
     execution_logs.append(full_msg)
 
 def clean_text(text):
-    """Zamienia polskie znaki na ASCII i standaryzuje linie, chroniąc FPDF przed nadpisywaniem tekstu"""
+    """Zamienia polskie znaki na ASCII i standaryzuje linie, chroniąc FPDF przed błędami"""
     if not text:
         return ""
     text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -72,8 +72,37 @@ def run_cmd(cmd):
     result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     return result.stdout, result.stderr, result.returncode
 
+def capture_visual_evidence(is_vm, test_id, png_path):
+    """Pobiera zrzut ekranu VM lub ostatnie linie logów kontenera LXC"""
+    if is_vm:
+        log("Pobieranie dowodu dzialania OS z konsoli hypervisora (screendump)...")
+        ppm_fake_log_path = f"/var/log/dr_screen_{test_id}.log"
+        node_name, _, _ = run_cmd("hostname")
+        node_name = node_name.strip()
+        run_cmd(f'pvesh create /nodes/{node_name}/qemu/{test_id}/monitor --command "screendump {ppm_fake_log_path}"')
+        
+        if os.path.exists(ppm_fake_log_path):
+            try:
+                with Image.open(ppm_fake_log_path) as im:
+                    im.save(png_path)
+                os.remove(ppm_fake_log_path)
+                log("Zrzut z konsoli graficznej pobrany pomyslnie.")
+                return "", ""
+            except Exception as e:
+                if os.path.exists(ppm_fake_log_path):
+                    os.remove(ppm_fake_log_path)
+                return f"Blad przetwarzania obrazu: {str(e)}", ""
+        else:
+            return "Blad: Brak wygenerowanego pliku obrazu z monitora QEMU.", ""
+    else:
+        log("Pobieranie ostatnich 25 linii logow systemowych z kontenera...")
+        ct_logs, _, _ = run_cmd(f"pct exec {test_id} -- tail -n 25 /var/log/messages 2>/dev/null || pct exec {test_id} -- journalctl -n 25 --no-pager 2>/dev/null")
+        if not ct_logs.strip():
+            ct_logs = "Brak wpisow w logach systemowych wewnatrz kontenera."
+        return "TRYB LXC: Ponizej zalaczono logi systemowe kontenera.", ct_logs
+
 def main():
-    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.27) ===")
+    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.28) ===")
     
     status_dr = "CRASHED_BEFORE_START"
     chosen_id = "UNKNOWN"
@@ -91,7 +120,7 @@ def main():
     web_screenshot_taken = False
 
     try:
-        # 1. Pobranie listy kopii zapasowych i wybór celu (manualny z timeoutem lub automatyczny)
+        # 1. Pobranie listy kopii zapasowych i wybór celu
         log(f"Pobieranie listy zasobow z repozytorium: {PBS_PVE_STORAGE}...")
         out, stderr, code = run_cmd(f"pvesm list {PBS_PVE_STORAGE}")
         if code != 0:
@@ -166,7 +195,7 @@ def main():
         else:
             chosen_name = f"Zasob_{chosen_id}"
 
-        # 3. Modyfikacja konfiguracji i izolacja sieciowa
+        # 3. Modyfikacja konfiguracji i zachowanie adresu MAC
         status_dr = "CONFIGURATION_FAILED"
         if is_vm:
             log("Analiza konfiguracji maszyny pod katem osieroconych obrazow ISO...")
@@ -176,8 +205,18 @@ def main():
                 log(f"Wysuwam brakujaca plyte ISO z napedu: {drive}")
                 run_cmd(f"qm set {TEST_VM_ID} --{drive} none")
 
-            log(f"Przepinanie wirtualnej karty do mostka {BRIDGE} (firewall=0) oraz aktywacja VGA std...")
-            run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE},firewall=0 --vga std --cpu kvm64")
+            log(f"Przepinanie karty do {BRIDGE} z zachowaniem oryginalnego MAC i modelu...")
+            net0_match = re.search(r"^net0:\s*(.+)$", vm_conf, re.MULTILINE)
+            if net0_match:
+                orig_net0 = net0_match.group(1).strip()
+                new_net0 = re.sub(r"bridge=[^,]+", f"bridge={BRIDGE}", orig_net0)
+                if "firewall=" in new_net0:
+                    new_net0 = re.sub(r"firewall=\d", "firewall=0", new_net0)
+                else:
+                    new_net0 += ",firewall=0"
+                run_cmd(f"qm set {TEST_VM_ID} --net0 {new_net0} --vga std --cpu kvm64")
+            else:
+                run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE},firewall=0 --vga std --cpu kvm64")
         else:
             log(f"Czyszczenie potencjalnych pozostalosci po interfejsach veth{TEST_VM_ID}i0...")
             run_cmd(f"ip link delete veth{TEST_VM_ID}i0 2>/dev/null")
@@ -192,30 +231,35 @@ def main():
             log(f"Izolacja kontenera na bridge {BRIDGE} z zachowaniem adresacji: {target_net}")
             run_cmd(f"pct set {TEST_VM_ID} --net0 name=eth0,bridge={BRIDGE},ip={target_net},firewall=0")
 
-        # 4. Rozruch środowiska z opóźnieniem
+        # 4. Rozruch środowiska
         status_dr = "BOOT_FAILED"
         log("Wydawanie komendy startu do hypervisora...")
-        if is_vm: _, stderr, code = run_cmd(f"qm start {TEST_VM_ID}")
-        else: _, stderr, code = run_cmd(f"pct start {TEST_VM_ID}")
+        if is_vm:
+            _, stderr, code = run_cmd(f"qm start {TEST_VM_ID}")
+        else:
+            _, stderr, code = run_cmd(f"pct start {TEST_VM_ID}")
 
         if code != 0:
             raise RuntimeError(f"System hypervisora nie byl w stanie uruchomic instancji: {stderr.strip()}")
 
         if is_vm:
-            log(f"Wykryto maszyne VM: Wstrzymuje skrypt na {BOOT_DELAY_VM} sekund na rozruch OS i uslug aplikacyjnych...")
+            log(f"Wykryto maszyne VM: Wstrzymuje skrypt na {BOOT_DELAY_VM} sekund na rozruch OS...")
             time.sleep(BOOT_DELAY_VM)  
         else:
             log(f"Wykryto kontener LXC: Wstrzymuje skrypt na {BOOT_DELAY_LXC} sekund na inicjalizacje...")
             time.sleep(BOOT_DELAY_LXC)
 
-        # 5. Silnik wykrywania adresu IP
+        # NATYCHMIASTOWY ZRZUT EKRANU (Gwarancja obecności konsoli w PDF nawet przy braku IP)
+        screenshot_error_msg, ct_logs = capture_visual_evidence(is_vm, TEST_VM_ID, png_path)
+
+        # 5. Silnik wykrywania adresu IP (Zwiększony bufor do 120s)
         status_dr = "NO_IP_FOUND"
         prefix = 24
         
         if is_vm:
-            log("Proba pobrania IP przez protokol QEMU Guest Agent (timeout 60s)...")
+            log("Proba pobrania IP przez protokol QEMU Guest Agent (timeout 120s)...")
             start_time = time.time()
-            while time.time() - start_time < 60:
+            while time.time() - start_time < 120:
                 agent_out, _, agent_code = run_cmd(f"qm guest cmd {TEST_VM_ID} network-get-interfaces 2>/dev/null")
                 if agent_code == 0 and agent_out:
                     try:
@@ -224,17 +268,17 @@ def main():
                             for ip_addr in iface.get("ip-addresses", []):
                                 if ip_addr.get("ip-address-type") == "ipv4":
                                     ip_candidate = ip_addr.get("ip-address").strip()
-                                    
-                                    # POPRAWKA: Twarde odrzucenie pętli zwrotnej (Windows Loopback / Linux lo)
-                                    if ip_candidate == "127.0.0.1" or ip_candidate.startswith("127."):
+                                    if ip_candidate == "127.0.0.1" or ip_candidate.startswith("127.") or ip_candidate.startswith("169.254."):
                                         continue
-                                        
                                     target_ip = ip_candidate
                                     prefix = ip_addr.get("prefix", 24)
                                     break
-                            if target_ip: break
-                        if target_ip: break
-                    except: pass
+                            if target_ip:
+                                break
+                        if target_ip:
+                            break
+                    except Exception:
+                        pass
                 time.sleep(5)
         else:
             if "dhcp" in target_net:
@@ -255,14 +299,15 @@ def main():
 
         # Awaryjny Sniffer ARP
         if not target_ip:
-            log("Brak komunikacji IP z systemem. Uruchamiam sniffer pakietow ARP na 30 sekund...")
+            log("Brak adresu w Guest Agencie. Uruchamiam sniffer pakietow ARP na 30 sekund...")
             proc = subprocess.Popen(f"timeout 30 tcpdump -l -n -i {BRIDGE} arp 2>/dev/null", shell=True, stdout=subprocess.PIPE, text=True)
             arp_start = time.time()
             while time.time() - arp_start < 30:
                 line = proc.stdout.readline()
-                if not line: break
+                if not line:
+                    break
                 match = re.search(r"tell\s+([0-9\.]+)", line)
-                if match and match.group(1) != "0.0.0.0":
+                if match and match.group(1) != "0.0.0.0" and not match.group(1).startswith("169.254."):
                     target_ip = match.group(1).strip()
                     break
             proc.terminate()
@@ -301,9 +346,8 @@ def main():
             nmap_out += f"\n\n[DIAGNOSTIC NOTE]\n" \
                         f"Nmap detected 0 open ports inside the isolated sandbox.\n" \
                         f"The temporary host is UP and network layer responds.\n" \
-                        f"If guest firewall is disabled, this means application background services\n" \
-                        f"(e.g. docker engines, database stacks, backup daemons) did not finish\n" \
-                        f"initialization inside the boot window. Consider increasing BOOT_DELAY_VM value in config.json."
+                        f"If guest firewall is disabled, background services did not finish initialization.\n" \
+                        f"Consider increasing BOOT_DELAY_VM in config.json."
         else:
             web_ports = re.findall(r"(\d+)/tcp\s+open\s+(\S+)", nmap_out)
             for port, service in web_ports:
@@ -314,54 +358,25 @@ def main():
                     
                     if shutil.which("chromium") or shutil.which("chromium-browser"):
                         chrome_bin = "chromium" if shutil.which("chromium") else "chromium-browser"
-                        log(f"🌐 Wykryto aktywny port web {port}. Uruchamiam Chromium 147 (15s budżetu czasu) dla: {web_url}...")
+                        log(f"🌐 Wykryto aktywny port web {port}. Uruchamiam Chromium 147 dla: {web_url}...")
                         
                         cmd_web = f"{chrome_bin} --headless --no-sandbox --disable-gpu --ignore-certificate-errors --virtual-time-budget=15000 --window-size=1920,1080 --screenshot={web_png_path} '{web_url}'"
                         _, c_err, web_code = run_cmd(cmd_web)
                         
                         if os.path.exists(web_png_path) and os.path.getsize(web_png_path) > 0:
-                            log("📸 [Chromium v147] Dowód działania nowoczesnej aplikacji (Proof of Life) został w pełni załadowany i zapisany.")
+                            log("📸 Dowod dzialania aplikacji webowej zostal zapisany.")
                             web_screenshot_taken = True
                             break
                         else:
-                            log(f"❌ [Chromium Error] Błąd migawki. Kod wyjścia: {web_code}")
-                            if c_err.strip(): log(f"   [Chromium STDERR]: {c_err.strip()}")
-                    else:
-                        log(f"[INFO] Wykryto port web {port}, ale pominięto zrzut ekranu (brak Chromium na Proxmoxie).")
+                            log(f"❌ [Chromium Error] Kod wyjscia: {web_code}")
+                            if c_err.strip():
+                                log(f"   [Chromium STDERR]: {c_err.strip()}")
                     break
 
         run_cmd(f"ip addr del {host_ip} dev {BRIDGE} 2>/dev/null || true")
         
         status_dr = "SUCCESS"
         log("Audyt sieciowy zakonczony pelnym sukcesem!")
-
-        # 7. Zbieranie Dowodów (Screenshot konsoli maszyn wirtualnych)
-        if is_vm:
-            log("Pobieranie wirtualnego zrzutu ekranu konsoli (Log Bypass)...")
-            screenshot_error_msg = ""
-            ppm_fake_log_path = f"/var/log/dr_screen_{TEST_VM_ID}.log"
-            node_name, _, _ = run_cmd("hostname")
-            node_name = node_name.strip()
-            
-            run_cmd(f'pvesh create /nodes/{node_name}/qemu/{TEST_VM_ID}/monitor --command "screendump {ppm_fake_log_path}"')
-            
-            if os.path.exists(ppm_fake_log_path):
-                try:
-                    with Image.open(ppm_fake_log_path) as im:
-                        im.save(png_path)
-                    os.remove(ppm_fake_log_path)
-                    log("Zrzut z konsoli graficznej pobrany pomyslnie.")
-                except Exception as e:
-                    screenshot_error_msg = f"Blad przetwarzania obrazu: {str(e)}"
-                    if os.path.exists(ppm_fake_log_path): os.remove(ppm_fake_log_path)
-            else:
-                screenshot_error_msg = "Blad: Brak wygenerowanego pliku obrazu z monitora QEMU."
-        else:
-            log("Zrzucanie ostatnich 25 linii logow systemowych z kontenera...")
-            screenshot_error_msg = "TRYB LXC: Ponizej zalaczono logi systemowe kontenera."
-            ct_logs, _, _ = run_cmd(f"pct exec {TEST_VM_ID} -- tail -n 25 /var/log/messages 2>/dev/null || pct exec {TEST_VM_ID} -- journalctl -n 25 --no-pager 2>/dev/null")
-            if not ct_logs.strip():
-                ct_logs = "Brak wpisow w logach systemowych wewnatrz kontenera."
 
     except Exception as e:
         log(f"KRYTYCZNY BLAD SKRYPTU: {str(e)}")
@@ -499,7 +514,8 @@ def main():
                 run_cmd(f"pct destroy {TEST_VM_ID} 2>/dev/null")
             
         for f in [png_path, web_png_path, pdf_path]:
-            if os.path.exists(f): os.remove(f)
+            if os.path.exists(f):
+                os.remove(f)
                 
         print(f"=== KONIEC PROCESU AUTOMATYZACJI. WYNIK: {status_dr} ===")
 
