@@ -1,4 +1,4 @@
-# Proxmox VE Automated DR Test Engine (v4.1)
+# Proxmox VE Automated DR Test Engine (v4.27)
 
 Automated Disaster Recovery (DR) testing script for Proxmox VE clusters connected to Proxmox Backup Server (PBS).
 
@@ -10,116 +10,243 @@ Automated Disaster Recovery (DR) testing script for Proxmox VE clusters connecte
 
 Skrypt służy do automatycznego i bezobsługowego testowania kopii zapasowych (Disaster Recovery) losowo wybranych maszyn wirtualnych (VM) oraz kontenerów (LXC) z repozytorium Proxmox Backup Server (PBS). 
 
-Całość wykonuje się w odizolowanym środowisku sieciowym (Sandbox). Skrypt sprawdza dostępność usług przez Nmap, zbiera logi lub zrzuty ekranu, a na koniec czyści po sobie storage i wysyła raport na e-mail oraz webhooka.
+Całość wykonuje się w odizolowanym środowisku sieciowym (Sandbox). Skrypt sprawdza dostępność usług przez Nmap (wraz z głębokim audytem skryptami NSE), generuje zrzuty ekranu z konsoli systemowej oraz **pobiera pełne, graficzne screenshoty paneli aplikacji webowych (np. UniFi, Proxmox, Oxidized, Xopero)** za pomocą dedykowanego silnika Chromium. Na koniec czyści po sobie storage i wysyła kompletny raport PDF na e-mail oraz webhooka.
 
 ### Jak działa skrypt?
 
-1. Losowanie celu: Pobiera pełną listę kopii z PBS, losuje jedną maszynę VM lub kontener LXC i lokalizuje najnowszy dostępny backup.
-2. Przywracanie: Klonuje wylosowany backup do wskazanego storage testowego pod tymczasowym ID 999.
-3. Czyszczenie konfigu: Odpina osierocone obrazy ISO (które mogłyby zablokować bootowanie) i czyści stare interfejsy sieciowe w jądrze.
-4. Izolacja sieci: Przepina wirtualną kartę sieciową do osobnego mostka (vmbr999), całkowicie odcinając maszynę od sieci produkcyjnej i internetu.
-5. Ekran dla VM: W przypadku maszyn wirtualnych wymusza standardową kartę graficzną (--vga std), żeby QEMU odpaliło bufor ekranu do screenshotów.
-6. Rozruch: Uruchamia instancję i czeka na pełne załadowanie systemu (40 sekund dla VM, 15 sekund dla LXC).
-7. Wykrywanie IP: Ustala adres IP przez QEMU Guest Agent, komendy pct exec lub pasywny sniffer pakietów ARP (tcpdump).
-8. Audyt portów: Tworzy tymczasowy alias IP na hoście Proxmoxa i skanuje wszystkie 65535 portów przez Nmap, wyciągając tylko te otwarte.
-9. Dowód działania: Robi screenshot z konsoli graficznej VM lub wyciąga 25 ostatnich linii logów systemowych z kontenera LXC.
-10. Raportowanie: Generuje plik PDF z pełnym logiem konsoli krok po kroku, wysyła go mailem i strzela webhookiem z podsumowaniem (np. na Slacka lub Discorda).
+1. **Losowanie celu:** Pobiera pełną listę kopii z PBS, losuje jedną maszynę VM lub kontener LXC i lokalizuje najnowszy dostępny backup (lub przyjmuje ID wskazane ręcznie).
+2. **Przywracanie:** Klonuje wylosowany backup do wskazanego storage testowego pod tymczasowym ID 999.
+3. **Czyszczenie konfigu:** Odpina osierocone obrazy ISO (które mogłyby zablokować bootowanie) i czyści stare interfejsy sieciowe w jądrze.
+4. **Izolacja sieci:** Przepina wirtualną kartę sieciową do osobnego mostka (vmbr999), całkowicie odcinając maszynę od sieci produkcyjnej i internetu.
+5. **Ekran dla VM:** W przypadku maszyn wirtualnych wymusza standardową kartę graficzną (`--vga std`), żeby QEMU odpaliło bufor ekranu do screenshotów.
+6. **Rozruch:** Uruchamia instancję i czeka na pełne załadowanie systemu i usług (domyślnie 90 sekund dla VM, 15 sekund dla LXC).
+7. **Wykrywanie IP:** Ustala adres IP przez QEMU Guest Agent, komendy `pct exec` lub pasywny sniffer pakietów ARP (`tcpdump`).
+8. **Audyt portów i usług:** Tworzy tymczasowy alias IP na hoście Proxmoxa i skanuje wszystkie porty przez Nmap z flagami `-sV -sC`. Wyciąga otwarte porty, bannery usług, nagłówki HTTP oraz klucze SSH.
+9. **Fotografia aplikacji Web (Proof of Life):** Jeśli wykryje port HTTP/HTTPS (w tym porty niestandardowe i deweloperskie jak 8888, 3000, 5000, 9000), uruchamia odizolowany silnik Chromium z buforem czasowym 15 sekund, pozwalając ciężkim panelom (SPA/React/Java) na pełne wyrenderowanie formularza logowania przed wykonaniem zrzutu.
+10. **Zrzut konsoli:** Robi screenshot z konsoli graficznej VM lub wyciąga 25 ostatnich linii logów systemowych z kontenera LXC.
+11. **Raportowanie:** Generuje plik PDF z pełnym logiem konsoli krok po kroku, wynikami Nmapa oraz wklejonymi obrazkami (konsola + strona www). Wysyła go mailem i strzela webhookiem z podsumowaniem (np. na Slacka lub Discorda).
 
 ### Wbudowane zabezpieczenia
 
-- Bezpieczeństwo produkcji: Skrypt działa wyłącznie na klonie. Nie dotyka oryginalnych maszyn ani rzeczywistych danych na PBS.
-- Izolacja sandbox: Blokada maszyny wewnątrz unikalnego vmbr999 bez routingu wyklucza konflikt adresów IP w sieci czy fałszywe alerty w monitoringach.
-- Gwarantowane czyszczenie (Failsafe): Cała logika sprzątająca siedzi w bloku finally. Niezależnie od błędu w trakcie testu (brak miejsca, timeout PBS), maszyna 999 zostanie bezwzględnie wyłączona i skasowana.
-- Ominięcie blokad AppArmor: Zrzut ekranu leci bezpośrednio do katalogu /var/log/ z rozszerzeniem .log, dzięki czemu kernel nie blokuje zapisu.
-- Odporność na awarię webhooka: Sekcja API ma własny try-except. Jeśli Slack leży, skrypt i tak wyśle maila i posprząta dyski.
-- Brak crashu na znakach Unicode: Funkcja clean_text() filtruje logi systemowe i usuwa polskie znaki przed budowaniem PDF, co zapobiega wywaleniu się biblioteki FPDF.
+* **Bezpieczeństwo produkcji:** Skrypt działa wyłącznie na klonie. Nie dotyka oryginalnych maszyn ani rzeczywistych danych na PBS.
+* **Izolacja sandbox:** Blokada maszyny wewnątrz unikalnego `vmbr999` bez routingu wyklucza konflikt adresów IP w sieci czy fałszywe alerty w monitoringach.
+* **Gwarantowane czyszczenie (Failsafe):** Cała logika sprzątająca siedzi w bloku `finally`. Niezależnie od błędu w trakcie testu, maszyna 999 zostanie bezwzględnie wyłączona i skasowana.
+* **Odporność na awarię sieci:** Sekcje powiadomień mają własne bloki przechwytywania wyjątków – awaria Slacka nie blokuje wysyłki maila ani czyszczenia dysków.
 
 ### Wymagania systemowe
 
-Zaloguj się na hosta PVE przez SSH jako root i zainstaluj pakiety:
+Zaloguj się na hosta PVE przez SSH jako root. Nowoczesne wersje Chromium (150+) posiadają blokady jądra (Crashpad locks), które uniemożliwiają działanie headless na maszynie matce Proxmoxa. **Wymagane jest zainstalowanie stabilnej wersji granicznej Chromium 147 i zablokowanie jej aktualizacji:**
 
 ```bash
-apt update && apt install nmap tcpdump python3-pil python3-fpdf -y
 ```
+# 1. Instalacja standardowych zależności
+```
+apt update && apt install -y nmap tcpdump python3-pil python3-fpdf wget
+```
+# 2. Przygotowanie bezpiecznego katalogu tymczasowego
+```
+mkdir -p /tmp/chromium147 && cd /tmp/chromium147
+```
+# 3. Pobranie paczek bezpośrednio z oficjalnego archiwum historycznego pool Debiana
+```
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb
+```
+# 4. Instalacja lokalna (APT automatycznie rozwiąże i doinstaluje brakujące zależności systemowe)
+```
+apt install -y ./*.deb
+```
+# 5. Blokada wersji przed automatyczną aktualizacją
+```
+apt-mark hold chromium chromium-common chromium-sandbox
+```
+# 6. Czyszczenie środowiska po instalacji
+```
+cd / && rm -rf /tmp/chromium147
+```
+Konfiguracja
 
-### Konfiguracja
-Edytuj sekcję GLOBAL CONFIGURATION na samym górze skryptu:
-PBS_PVE_STORAGE: Nazwa Twojego storage PBS w Proxmoxie (np. PBS-1Y).
-TARGET_STORAGE: Storage docelowy na maszynę testową (np. local-lvm lub SANDBOX).
-TEST_VM_ID: Tymczasowe ID instancji testowej (domyślnie 999).
-BRIDGE: Odizolowany mostek sieciowy (np. vmbr999).
-WEBHOOK_URL: URL do webhooka Slack/Discord/Teams. Jeśli nie używasz, zostaw puste "".
-Pola SMTP_* oraz MAIL_TO: Dane serwera pocztowego do wysyłki raportów PDF.
+Edytuj plik config.json znajdujący się w tym samym katalogu co skrypt:
+
+    PBS_PVE_STORAGE: Nazwa Twojego storage PBS w Proxmoxie (np. PBS-1Y).
+
+    TARGET_STORAGE: Storage docelowy na maszynę testową (np. local-lvm).
+
+    TEST_VM_ID: Tymczasowe ID instancji testowej (domyślnie 999).
+
+    BRIDGE: Odizolowany mostek sieciowy (np. vmbr999).
+
+    BOOT_DELAY_VM / BOOT_DELAY_LXC: Czas oczekiwania na podniesienie OS (sekundy).
+
+    WEBHOOK_URL: URL do webhooka Slack/Discord/Teams. Jeśli nie używasz, zostaw puste "".
+
+    Pola SMTP_* oraz MAIL_TO: Dane serwera pocztowego do wysyłki raportów PDF.
+
 Uruchomienie
+
 Wrzuć skrypt na Proxmoxa jako /root/dr_test_automation.py.
 Nadaj uprawnienia:
 ```Bash
+
 chmod +x /root/dr_test_automation.py
 ```
 Odpal test ręcznie:
 ```Bash
+
 python3 /root/dr_test_automation.py
 ```
 Harmonogram Crontab
-Żeby skrypt leciał automatycznie w każdą niedzielę o 2:00 w nocy:
-```Bash
-crontab -e
-```
-Wklej na samym dole:
-Fragment kodu
+
+Żeby skrypt leciał automatycznie w każdą niedzielę o 2:00 w nocy, wpisz crontab -e i wklej na samym dole:
+Plaintext
 ```
 0 2 * * 0 /usr/bin/python3 /root/dr_test_automation.py >> /var/log/dr_script_cron.log 2>&1
 ```
-## Instructions (English Version)
+##Instructions (English Version)
+
 Automated, hands-free Disaster Recovery (DR) testing script for randomly selected Virtual Machines (VM) and Containers (LXC) stored on Proxmox Backup Server (PBS).
-It runs inside a 100% isolated sandbox network, performs a full service port audit via Nmap, captures console screenshots or system logs, emails a PDF report, fires a webhook, and cleans up the storage afterward.
-### How it works
-1. Target Selection: Fetches the backup list from PBS, randomly picks a VM or LXC, and finds the latest snapshot.
-2. Restore: Clones the selected backup to the designated test storage using temporary ID 999.
-3. Config Sanitation: Detaches orphaned ISO images and cleans old network interfaces in the kernel.
-4. Network Isolation: Reconfigures the network interface to an isolated bridge (vmbr999), cutting it off from the LAN and Internet.
-5. Display for VM: Forces a standard graphic card (--vga std) for VMs to initialize the frame buffer for screenshots.
-6. Booting: Starts the instance and waits for the OS to initialize (40s for VM, 15s for LXC).
-7. IP Resolution: Detects the internal IP via QEMU Guest Agent, pct exec, or passive ARP sniffing (tcpdump).
-8. Port Audit: Creates a temporary IP alias on the host and scans all 65535 ports using Nmap, listing open services only.
-9. Evidence Collection: Captures a graphical screenshot of the VM console or extracts the last 25 lines of LXC logs.
-10. Reporting: Generates a step-by-step PDF report from the console log, emails it, and sends a summary via Webhook.
-### Built-in Failsafe Features
-1. Production Safe: Operates strictly on cloned data. Never touches live environments or actual PBS backup chunks.
-2. Sandbox Isolation: Locking the machine inside an unrouted vmbr999 bridge prevents IP conflicts and false monitoring alerts.
-3. Failsafe Storage Protection: The entire cleanup routine is wrapped in a finally block. No matter where the script fails, instance 999 is unconditionally stopped and destroyed.
-4. AppArmor Bypass: Saves raw screen dumps directly to /var/log/ as a .log file to bypass kernel write blocks.
-5. Webhook Fault Tolerance: The API notification logic runs in its own try-except handler. If your chat platform is down, email delivery and disk wiping still execute.
-6. Unicode Crash Prevention: The clean_text() filter strips out non-ASCII characters and foreign diacritics, preventing FPDF engine crashes.
-### Prerequisites
-Log in via SSH to your PVE node as root and run:
-```Bash
-apt update && apt install nmap tcpdump python3-pil python3-fpdf -y
+
+It runs inside a 100% isolated sandbox network, performs a full service port and banner audit via Nmap NSE, captures system console screenshots, takes pixel-perfect graphical screenshots of web application panels (e.g., UniFi, Proxmox, Oxidized, Xopero) using a dedicated Chromium engine, emails a PDF report, fires a webhook, and cleans up the storage afterward.
+How it works
+
+  1.**Target Selection:** Fetches the backup list from PBS, randomly picks a VM or LXC, and finds the latest snapshot (or accepts a manually specified ID).
+
+  2.**Restore:** Clones the selected backup to the designated test storage using temporary ID 999.
+
+  3.**Config Sanitation:** Detaches orphaned ISO images and cleans old network interfaces in the kernel.
+
+  4.**Network Isolation:** Reconfigures the network interface to an isolated bridge (vmbr999), cutting it off from the LAN and Internet.
+
+  5.**Display for VM:** Forces a standard graphic card (--vga std) for VMs to initialize the frame buffer for screenshots.
+
+  6.**Booting:** Starts the instance and waits for the OS and background daemons to initialize (default 90s for VM, 15s for LXC).
+
+  7.**IP Resolution:** Detects the internal IP via QEMU Guest Agent, pct exec, or passive ARP sniffing (tcpdump).
+
+  8.**Port & Service Audit:** Creates a temporary IP alias on the host and scans all ports using Nmap with -sV -sC flags to extract open services, banners, HTTP headers, and SSH keys.
+
+  9.**Web App Photography (Proof of Life):** If a web service is detected (including custom management ports like 8888, 3000, 5000, 9000), it deploys the Chromium engine with a 15-second virtual time budget, ensuring heavy client-side applications (SPA/React/Java) fully render their login pages before capturing the image.
+
+  10.**Evidence Collection:** Captures a graphical screenshot of the VM console or extracts the last 25 lines of LXC logs.
+
+  11.**Reporting:** Generates a comprehensive step-by-step PDF report including terminal outputs, Nmap audit results, and embedded images (both console and web application screen). Delivers it via SMTP mail and posts a summary via Webhook.
+
+System Prerequisites
+
+Log in via SSH to your PVE node as root. Modern Chromium builds (150+) introduce kernel-level namespace constraints (Crashpad handlers) that cause immediate crashes on a bare Proxmox host. You must downgrade to the stable threshold version (Chromium 147) and pin the packages:
+
+Bash
+# 1. Update system package index and install baseline dependencies
 ```
-### Configuration
-Modify the GLOBAL CONFIGURATION section at the top of the script:
-PBS_PVE_STORAGE: The name of your PBS storage in PVE (e.g., PBS-1Y).
-TARGET_STORAGE: Target storage where the temporary instance will be restored (e.g., local-lvm).
-TEST_VM_ID: Temporary VMID used for the sandbox environment (default 999).
-BRIDGE: Isolated virtual network bridge (e.g., vmbr999).
-WEBHOOK_URL: Your webhook URL (Slack/Discord/Teams). Leave as "" to disable.
-SMTP_* fields & MAIL_TO: Mail server settings for PDF report delivery.
-Usage
-Save the script on the Proxmox host as /root/dr_test_automation.py.
-Make it executable:
-```Bash
-chmod +x /root/dr_test_automation.py
+apt update && apt install -y nmap tcpdump python3-pil python3-fpdf wget
 ```
-Run a manual dry run:
-```Bash
-python3 /root/dr_test_automation.py
+# 2. Create an isolated temporary deployment workspace
 ```
-Crontab Automation
-To schedule the script to run every Sunday at 2:00 AM:
-```Bash
-crontab -e
+mkdir -p /tmp/chromium147 && cd /tmp/chromium147
 ```
-Append the following line:
+# 3. Fetch exact package binaries from the official Debian snapshot archive pool
 ```
-0 2 * * 0 /usr/bin/python3 /root/dr_test_automation.py >> /var/log/dr_script_cron.log 2>&1
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb)
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb)
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb)
 ```
+# 4. Perform a local installation (APT will natively resolve and pull missing OS shared libraries)
+```
+apt install -y ./*.deb
+```
+# 5. Hold and lock the packages to freeze them against future 'apt upgrade' cycles
+```
+apt-mark hold chromium chromium-common chromium-sandbox
+```
+# 6. Purge temporary setup artifacts from the hypervisor storage
+```
+cd / && rm -rf /tmp/chromium147
+```
+
+Changelog / Historia zmian
+v4.27
+
+🇵🇱 Wersja polska:
+
+  Naprawiono błąd wykrywania IP Loopback na Windows: Rozwiązano krytyczny problem, w którym maszyny wirtualne z systemem Windows raportowały interfejs pętli zwrotnej przez QEMU Guest Agent pod nazwą Loopback Pseudo-Interface 1 zamiast lo. Powodowało to błędne przechwytywanie adresu 127.0.0.1 jako adresu IP celu.  
+
+Ochrona przed skanowaniem samego hosta: Zastąpiono zawodne filtrowanie po nazwach interfejsów bezwzględnym filtrem na poziomie adresów IP (ip.startswith("127.")). Całkowicie eliminuje to ryzyko, że skrypt weźmie pod ostrzał Nmapa usługi lokalne samego hypervisora Proxmox podczas testowania systemów Windows.
+
+🇬🇧 English Version:
+
+Fixed Windows Loopback IP Resolution Bug: Resolved a critical issue where Windows VMs reporting a loopback adapter via the QEMU Guest Agent (named Loopback Pseudo-Interface 1 instead of Linux's standard lo) would trick the script into capturing 127.0.0.1 as the target production IP.  
+
+Hypervisor Self-Scanning Protection: Migrated away from unreliable interface name-based filtering to a strict IP-level validation handler (ip.startswith("127.")). This completely prevents the script from accidentally targeting and auditing the Proxmox host's own local services (like the PVE API daemon) when testing Windows environments.
+
+v4.26
+
+🇵🇱 Wersja polska:
+
+    Rozszerzenie tablicy monitorowanych portów webowych: Rozbudowano wewnętrzny filtr skryptu o porty deweloperskie i administracyjne: 8888 (Oxidized / Puma), 3000 (Grafana), 5000 (Docker Registry / Flask) oraz 9000 (Portainer). Zapobiega to pomijaniu paneli webowych w sytuacji, gdy Nmap zidentyfikuje usługę pod niestandardową lub nierozpoznaną nazwą (np. sun-answerbook?).
+
+🇬🇧 English Version:
+
+    Expanded Monitored Web Ports Array: Expanded the internal web port validation matrix to include common administrative and development ports: 8888 (Oxidized / Puma), 3000 (Grafana), 5000 (Docker Registry), and 9000 (Portainer). This prevents the capture engine from skipping web applications when Nmap flags the service under generic non-standard labels (e.g., sun-answerbook?).
+
+v4.25
+
+🇵🇱 Wersja polska:
+
+    Wdrożenie buforu czasu dla JavaScript (SPA): Dodano flagę --virtual-time-budget=15000 (15 sekund) do silnika graficznego Chromium. Pozwala to na pełne załadowanie i wykonanie asynchronicznych skryptów JS na ciężkich panelach logowania (UniFi, Xopero, Proxmox API) przed przechwyceniem obrazu, eliminując problem "pustych białych pasków".
+
+🇬🇧 English Version:
+
+    JavaScript Execution Time Budget (SPA): Integrated the --virtual-time-budget=15000 (15 seconds) flag into the Chromium capture command. This forces the browser to wait for heavy asynchronous JS components (such as UniFi, Xopero, or PVE login frameworks) to render completely before taking the snapshot, eliminating empty white bar artifacts.
+
+v4.24
+
+🇵🇱 Wersja polska:
+
+    Przywrócenie silnika Chromium (Obejście blokad jądra PVE): Ze względu na ograniczenia przestrzeni nazw jądra Linuxa i asercje modułu Crashpad wprowadzone w Chromium 150+, udokumentowano i zaimplementowano procedurę obniżenia wersji przeglądarki do Chromium 147 (apt-mark hold). Skrypt odzyskał natywną możliwość robienia zrzutów ekranu stron www bezpośrednio z poziomu konta root na hoście.
+
+🇬🇧 English Version:
+
+    Chromium Engine Restoration (PVE Kernel Namespace Bypass): Due to strict Linux kernel namespace locks and Crashpad assertions introduced in Chromium 150+, documented and deployed a package pinning strategy downgrading the browser to Chromium 147 (apt-mark hold). Restored native full-fidelity web screenshot captures running directly as root on the hypervisor host.
+
+v4.20
+
+🇵🇱 Wersja polska:
+
+    Głęboki audyt usług za pomocą Nmap NSE: Do głównego skanowania sieciowego dodano flagę -sC (skrypty domyślne Nmap Scripting Engine). Skrypt automatycznie pobiera teraz zaawansowane dane diagnostyczne: nagłówki serwerów, metody HTTP, tytuły stron HTML oraz odciski kluczy hostów SSH i umieszcza je bezpośrednio w Sekcji 2 raportu PDF.
+
+🇬🇧 English Version:
+
+    Deep Service Auditing via Nmap NSE: Appended the -sC (default Nmap Scripting Engine scripts) flag to the scanning engine. The engine now automatically extracts deep diagnostic parameters: server header data, HTTP methods, native HTML page titles, and SSH host key fingerprints, embedding them seamlessly into Section 2 of the PDF report.
+
+v4.16
+
+🇵🇱 Wersja polska:
+
+    Rozbudowane logowanie błędów podprocesów: Dodano pełne przechwytywanie strumieni STDOUT/STDERR oraz kodów wyjścia dla zewnętrznych narzędzi renderujących. Wszystkie niepowodzenia systemowe są teraz jawnie wypisywane w konsoli i dołączane do raportu tekstowego.
+
+🇬🇧 English Version:
+
+    Subprocess Error Logging Overhaul: Implemented exhaustive STDOUT/STDERR and exit-code capture handlers for external rendering utilities. Any runtime environment faults are now clearly isolated, echoed to the screen, and attached to the text log dump.
+
+v4.12
+
+🇵🇱 Wersja polska:
+
+    Zewnętrzny plik konfiguracyjny (config.json): Odseparowano hasła SMTP, tokeny webhooków i nazwy zasobów od kodu źródłowego.
+
+    Manualny wybór ID z timeoutem: Dodano opcję ręcznego wskazania ID maszyny do testu DR (15 sekund oczekiwania na wpis przed losowaniem).
+
+    Dynamiczne pobieranie nazw maszyn: Skrypt pobiera prawdziwą nazwę bezpośrednio z odzyskanej konfiguracji Proxmoxa.
+
+    Deaktywacja Zapory PVE (Firewall): Wymuszono wyłączenie firewallu dla instancji testowej (firewall=0).
+
+🇬🇧 English Version:
+
+    Externalized Configuration (config.json): Separated credentials (SMTP, webhooks, storages) from the script code.
+
+    Manual ID Input with Timeout: Added capability to manually select a specific ID for the DR test (15-second prompt fallback to random).
+
+    Robust Name Resolution: Extracted real VM/CT hostnames directly from the restored configuration.
+
+    PVE Firewall Deactivation: Disabled the network cluster firewall for the temporary instance (firewall=0).
